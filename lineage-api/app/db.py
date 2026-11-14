@@ -53,6 +53,49 @@ CREATE INDEX IF NOT EXISTS idx_inputs_group
     ON group_inputs(group_id);
 CREATE INDEX IF NOT EXISTS idx_inputs_name
     ON group_inputs(input_name);
+
+-- Immutable registration event log. Every successfully committed batch appends
+-- exactly one row here, inside the same transaction that updates the live
+-- graph, so lineage and event become visible atomically. The per-event node /
+-- group / input tables are copies of the definitions *as submitted in that
+-- batch*: later overwrites replace the live graph but never mutate history.
+CREATE TABLE IF NOT EXISTS registration_events (
+    seq         INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at  TEXT NOT NULL,
+    node_count  INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS event_nodes (
+    event_id   INTEGER NOT NULL
+               REFERENCES registration_events(seq),
+    node_name  TEXT NOT NULL,
+    node_kind  TEXT NOT NULL,
+    position   INTEGER NOT NULL,
+    PRIMARY KEY (event_id, node_name)
+);
+
+CREATE TABLE IF NOT EXISTS event_groups (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_id   INTEGER NOT NULL
+               REFERENCES registration_events(seq),
+    node_name  TEXT NOT NULL,
+    position   INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS event_group_inputs (
+    group_id    INTEGER NOT NULL
+                REFERENCES event_groups(id),
+    input_name  TEXT NOT NULL,
+    position    INTEGER NOT NULL,
+    PRIMARY KEY (group_id, input_name)
+);
+
+CREATE INDEX IF NOT EXISTS idx_event_nodes_event
+    ON event_nodes(event_id);
+CREATE INDEX IF NOT EXISTS idx_event_groups_event
+    ON event_groups(event_id);
+CREATE INDEX IF NOT EXISTS idx_event_inputs_group
+    ON event_group_inputs(group_id);
 """
 
 

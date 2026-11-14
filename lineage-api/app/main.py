@@ -5,7 +5,7 @@ from __future__ import annotations
 import sqlite3
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Query, Request
 from fastapi.responses import JSONResponse
 
 from . import service
@@ -17,6 +17,7 @@ from .models import (
     ImpactResponse,
     RegisterRequest,
     RegisterResponse,
+    SyncResponse,
 )
 
 
@@ -99,3 +100,27 @@ def impact(payload: ImpactRequest) -> dict:
 def graph() -> dict:
     """查看当前已提交的完整血缘快照。"""
     return service.get_graph()
+
+
+@app.get(
+    "/lineage/sync",
+    response_model=SyncResponse,
+    tags=["lineage"],
+)
+def sync(
+    cursor: str | None = Query(
+        default=None,
+        description=(
+            "首次请求省略（或传 start），返回完整血缘快照与首个游标；"
+            "之后原样回传上一次响应中的 next_cursor 拉取后续登记批次。"
+        ),
+    ),
+    limit: int = Query(
+        default=100,
+        ge=1,
+        le=1000,
+        description="单页最多返回的登记批次数（批次始终保持完整，不会拆分）。",
+    ),
+) -> dict:
+    """向另一套元数据目录同步：快照 + 有序、不重不漏的登记批次。"""
+    return service.sync(cursor, limit)

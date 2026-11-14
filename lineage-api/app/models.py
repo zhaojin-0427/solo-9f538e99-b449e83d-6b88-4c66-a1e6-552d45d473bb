@@ -70,3 +70,26 @@ class NodeOut(BaseModel):
 class GraphResponse(BaseModel):
     nodes: list[NodeOut]
     counts: dict[str, int]
+
+
+class SyncBatchNode(NodeOut):
+    """Node definition captured in an immutable registration event."""
+
+
+class SyncBatch(BaseModel):
+    seq: int = Field(description="登记批次的全局单调递增序号")
+    created_at: str = Field(description="批次提交时间（UTC，ISO 8601）")
+    node_count: int
+    nodes: list[SyncBatchNode] = Field(
+        description="该批次提交时各字段的定义副本（不随后续覆盖变化）"
+    )
+
+
+class SyncResponse(BaseModel):
+    # 仅首次请求（无 cursor）返回；分页请求为 null。
+    snapshot: GraphResponse | None = None
+    batches: list[SyncBatch] = Field(
+        description="有序登记批次；首次请求为空数组"
+    )
+    next_cursor: str = Field(description="不透明游标，原样回传即可继续翻页")
+    has_more: bool = Field(description="紧随其后是否还有未交付批次")

@@ -28,3 +28,8 @@ class CycleDetectedError(ConflictLineageError):
 class NotFoundLineageError(LineageError):
     status_code = 404
     code = "not_found"
+
+
+class InvalidCursorError(LineageError):
+    status_code = 400
+    code = "invalid_cursor"

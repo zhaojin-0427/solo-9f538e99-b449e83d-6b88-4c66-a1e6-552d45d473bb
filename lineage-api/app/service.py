@@ -5,11 +5,14 @@ from __future__ import annotations
 import sqlite3
 import sys
 from collections import defaultdict
+from datetime import datetime, timezone
 
+from . import cursor as cursor_codec
 from . import db
 from .exceptions import (
     ConflictLineageError,
     CycleDetectedError,
+    InvalidCursorError,
     NotFoundLineageError,
     ValidationLineageError,
 )
@@ -241,6 +244,39 @@ def register_batch(
                 {"cycle": cycle},
             )
 
+        # ---- immutable event: lineage and event commit atomically ----
+        # Copy the definitions as submitted in THIS batch into the event log.
+        # The rows are never updated afterwards, so later overwrites cannot
+        # change the definition attached to an older event.
+        event_cur = conn.execute(
+            "INSERT INTO registration_events(created_at, node_count) "
+            "VALUES(?, ?)",
+            (
+                datetime.now(timezone.utc).isoformat(),
+                len(payload_nodes),
+            ),
+        )
+        event_id = event_cur.lastrowid
+        for pos, node in enumerate(payload_nodes):
+            conn.execute(
+                "INSERT INTO event_nodes(event_id, node_name, node_kind, "
+                "position) VALUES(?, ?, ?, ?)",
+                (event_id, node.name, node.kind, pos),
+            )
+            for group_pos, group in enumerate(node.candidate_groups):
+                group_cur = conn.execute(
+                    "INSERT INTO event_groups(event_id, node_name, position) "
+                    "VALUES(?, ?, ?)",
+                    (event_id, node.name, group_pos),
+                )
+                egid = group_cur.lastrowid
+                for inp_pos, inp in enumerate(group):
+                    conn.execute(
+                        "INSERT INTO event_group_inputs(group_id, input_name, "
+                        "position) VALUES(?, ?, ?)",
+                        (egid, inp, inp_pos),
+                    )
+
     return {
         "registered": len(payload_nodes),
         "nodes": sorted(node.name for node in payload_nodes),
@@ -359,3 +395,179 @@ def get_graph(db_path: str | None = None) -> dict:
     for kind in kinds.values():
         counts[kind] += 1
     return {"nodes": nodes, "counts": counts}
+
+
+# --------------------------------------------------------------------------- #
+# Catalog sync: full snapshot on first call, ordered event batches afterwards
+# --------------------------------------------------------------------------- #
+
+def _graph_snapshot(conn: sqlite3.Connection) -> dict:
+    """Serialise the live lineage graph inside an already-open snapshot."""
+    kinds, groups = load_graph(conn)
+    nodes = [
+        {
+            "name": name,
+            "kind": kinds[name],
+            "candidate_groups": groups.get(name, []),
+        }
+        for name in sorted(kinds)
+    ]
+    counts: dict[str, int] = {"source": 0, "derived": 0, "report": 0}
+    for kind in kinds.values():
+        counts[kind] += 1
+    return {"nodes": nodes, "counts": counts}
+
+
+def get_sync_snapshot(db_path: str | None = None) -> dict:
+    """First sync request: full lineage plus a cursor for subsequent polling.
+
+    Both the graph and the event watermark are read from one WAL snapshot
+    transaction, so the returned cursor is exactly aligned with the graph:
+    events committed in the same snapshot are already reflected in the graph,
+    and paging from the cursor only returns strictly newer batches.
+    """
+    with db.snapshot(db_path) as conn:
+        snapshot = _graph_snapshot(conn)
+        row = conn.execute(
+            "SELECT MAX(seq) AS max_seq FROM registration_events"
+        ).fetchone()
+        watermark = row["max_seq"] if row["max_seq"] is not None else 0
+    return {
+        "snapshot": snapshot,
+        "batches": [],
+        "next_cursor": cursor_codec.encode(watermark),
+        "has_more": False,
+    }
+
+
+def _load_batches(
+    conn: sqlite3.Connection, event_ids: list[int]
+) -> list[dict]:
+    """Rebuild complete batches (with their own definition copies) by seq."""
+    if not event_ids:
+        return []
+    placeholders = ",".join("?" for _ in event_ids)
+
+    node_rows = conn.execute(
+        f"SELECT event_id, node_name, node_kind, position "
+        f"FROM event_nodes WHERE event_id IN ({placeholders}) "
+        f"ORDER BY event_id, position",
+        tuple(event_ids),
+    ).fetchall()
+    group_rows = conn.execute(
+        f"SELECT id, event_id, node_name, position "
+        f"FROM event_groups WHERE event_id IN ({placeholders}) "
+        f"ORDER BY event_id, node_name, position",
+        tuple(event_ids),
+    ).fetchall()
+    group_ids = [row["id"] for row in group_rows]
+    input_rows = []
+    if group_ids:
+        in_placeholders = ",".join("?" for _ in group_ids)
+        input_rows = conn.execute(
+            f"SELECT group_id, input_name, position "
+            f"FROM event_group_inputs WHERE group_id IN ({in_placeholders}) "
+            f"ORDER BY group_id, position",
+            tuple(group_ids),
+        ).fetchall()
+
+    event_meta = {
+        row["seq"]: row
+        for row in conn.execute(
+            f"SELECT seq, created_at, node_count "
+            f"FROM registration_events WHERE seq IN ({placeholders})",
+            tuple(event_ids),
+        ).fetchall()
+    }
+
+    inputs_by_group: dict[int, list[str]] = defaultdict(list)
+    for row in input_rows:
+        inputs_by_group[row["group_id"]].append(row["input_name"])
+
+    groups_by_event: dict[int, dict[str, list[list[str]]]] = defaultdict(
+        lambda: defaultdict(list)
+    )
+    for row in group_rows:
+        groups_by_event[row["event_id"]][row["node_name"]].append(
+            inputs_by_group.get(row["id"], [])
+        )
+
+    nodes_by_event: dict[int, list[dict]] = defaultdict(list)
+    for row in node_rows:
+        nodes_by_event[row["event_id"]].append(
+            {
+                "name": row["node_name"],
+                "kind": row["node_kind"],
+                # Definitions are the copies captured at commit time, not the
+                # node's current (possibly overwritten) definition.
+                "candidate_groups": groups_by_event[row["event_id"]].get(
+                    row["node_name"], []
+                ),
+            }
+        )
+
+    batches: list[dict] = []
+    for event_id in event_ids:
+        meta = event_meta[event_id]
+        batches.append(
+            {
+                "seq": event_id,
+                "created_at": meta["created_at"],
+                "node_count": meta["node_count"],
+                "nodes": nodes_by_event.get(event_id, []),
+            }
+        )
+    return batches
+
+
+def get_sync_batches(
+    after_seq: int, limit: int, db_path: str | None = None
+) -> dict:
+    """Paginate committed registration batches after ``after_seq``.
+
+    Rows are fetched strictly by monotonically increasing ``seq``; the query
+    asks for ``limit + 1`` rows so the page boundary can be detected without
+    ever splitting a batch. All reads run in one snapshot transaction, hence a
+    sequence of calls — each resuming from the previous ``next_cursor`` —
+    delivers every committed batch exactly once, even while registrations run
+    concurrently.
+    """
+    with db.snapshot(db_path) as conn:
+        rows = conn.execute(
+            "SELECT seq FROM registration_events WHERE seq > ? "
+            "ORDER BY seq ASC LIMIT ?",
+            (after_seq, limit + 1),
+        ).fetchall()
+        has_more = len(rows) > limit
+        page_rows = rows[:limit]
+        event_ids = [row["seq"] for row in page_rows]
+        batches = _load_batches(conn, event_ids)
+
+    last_seq = event_ids[-1] if event_ids else after_seq
+    return {
+        "snapshot": None,
+        "batches": batches,
+        "next_cursor": cursor_codec.encode(last_seq),
+        "has_more": has_more,
+    }
+
+
+def sync(
+    cursor_token: str | None, limit: int, db_path: str | None = None
+) -> dict:
+    """Entry point for ``GET /lineage/sync``.
+
+    No cursor (or the literal ``start`` marker) returns the full lineage
+    snapshot and the first cursor; any other token resumes ordered batch
+    pagination from that point.
+    """
+    if cursor_token is None or cursor_token == "start":
+        return get_sync_snapshot(db_path)
+    try:
+        after_seq = cursor_codec.decode(cursor_token)
+    except ValueError as exc:
+        raise InvalidCursorError(
+            "游标无效或已损坏，请从最近一次返回的 next_cursor 继续",
+            {"cursor": cursor_token},
+        ) from exc
+    return get_sync_batches(after_seq, limit, db_path)
